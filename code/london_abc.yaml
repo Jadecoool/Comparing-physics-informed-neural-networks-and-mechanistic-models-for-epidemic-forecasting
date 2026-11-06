@@ -1,0 +1,202 @@
+# =============================================================================
+# Configuration for ABC-with-budget calibration of the London COVID-19 SEIR model
+# =============================================================================
+# Every knob that affects results lives here. A copy of this file is stored
+# alongside every candidate pool (meta.json) so runs stay reproducible.
+
+# --- paths -------------------------------------------------------------------
+paths:
+  data: "../data"                       # root of the data/ folder
+  contact_matrix: "../data/regions/London/contacts_matrix/contacts_all_locations.csv"
+  ifr: "../data/regions/London/epidemic/IFR_hetero.csv"
+  output: "../output"                   # pools + selections + figures go here
+  # Target series. weekly_deaths_total.csv is total-only and covers
+  # 2020-02-16 .. 2020-08-02 (25 weekly points, the first four of them zero);
+  # weekly_deaths.csv is age-resolved but starts 2020-03-15. Using the by_age
+  # target (abc.target: "by_age") requires the age-resolved file, and with it
+  # start_simu_date cannot go earlier than 2020-03-15.
+  weekly_deaths: "../data/regions/London/epidemic/weekly_deaths_total.csv"
+
+# --- basin / simulation window ----------------------------------------------
+simulation:
+  basin: "London"
+  start_org_date: "2020-02-15"          # simulation seeding date (burn-in starts here)
+                                        # CANNOT go earlier while mobility: "data":
+                                        # all_reductions.csv starts on this very day,
+                                        # and _build_omega() refuses to run with gaps.
+  start_simu_date: "2020-02-16"         # first week that is compared against data
+                                        # (must be a week-ending Sunday of the grid;
+                                        #  2020-02-16 .. 2020-08-02 = 25 weekly points)
+                                        #
+                                        # Was 2020-03-08 (22 points). Moved back so
+                                        # the week grid is IDENTICAL to system B's
+                                        # (SEIR null, pool seir_1M_0216), which
+                                        # already scores 2020-02-16 .. 2020-08-02.
+                                        # Without this the two systems' window index
+                                        # t means a different date in each and the
+                                        # Rt curves cannot be put side by side.
+                                        #
+                                        # NOTE the first bin is SHORT. start_org_date
+                                        # is a Saturday, so pandas closes the first
+                                        # week on 2020-02-16 holding only 02-15 and
+                                        # 02-16 -- 2 days, not 7. It does no damage
+                                        # here: the observed value for that week is 0,
+                                        # and no candidate can produce a death before
+                                        # start_org_date + Delta >= 2020-02-22, so the
+                                        # bin is 0 against 0 whatever its width. If
+                                        # start_org_date ever moves, recheck this.
+  end_date: "2020-08-02"                # last week of the pool (INCLUSIVE, see note)
+  daily_steps: 12                       # sub-steps per day in the tau-leap loop
+  # NOTE on `end_date`: the original SEIR_model_general.py used
+  #   T = (end_date - start_org_date).days
+  # which stops the day BEFORE end_date and leaves the final ISO week 1 day
+  # short (a systematic ~1/7 undercount in the last weekly point). Here the
+  # end_date is treated as INCLUSIVE so every weekly bin holds a full 7 days.
+  # Set `legacy_end_date_exclusive: true` to reproduce the old behaviour.
+  legacy_end_date_exclusive: false
+
+# --- fixed epidemiological parameters ----------------------------------------
+model:
+  eps: 0.27027027                       # 1 / latent period
+  mu: 0.4                               # 1 / infectious period
+  # How the contact matrix varies over time.
+  #   "none"   -> CONSTANT contact matrix (omega = 1 every day). Each candidate's
+  #               R0 is then a genuine constant for the whole trajectory and is the
+  #               textbook basic reproduction number; the epidemic turns over purely
+  #               through susceptible depletion. all_reductions.csv is not read, so
+  #               end_date is not limited by its coverage.
+  #   "data"   -> rescale C by the daily mobility values in all_reductions.csv
+  #               (covers 2020-02-15 .. 2020-12-31). R0 is then anchored to the
+  #               contact level on start_org_date and the effective reproduction
+  #               number moves day to day.
+  #   "freeze" -> as "data" up to 2020-07-05, then held constant. This is what
+  #               functions_general.imply_reductions() does; kept so abc_validate.py
+  #               can reproduce the original model exactly.
+  mobility: "data"
+
+# --- priors (sampled independently, 1 draw per candidate) --------------------
+priors:
+  R0:
+    dist: "uniform"
+    min: 1.3
+    max: 3.0
+  inf_t0:                               # was `i0`; renamed so A and B label the
+    dist: "uniform"                     # same quantity the same way. System B
+    min: 1.0                            # draws this LOG-uniformly, so the two are
+    max: 10000.0                        # not yet strictly comparable on this
+                                        # parameter -- switch to "loguniform" here
+                                        # if the paper needs them matched.
+  Delta:
+    dist: "randint"                     # integer days, inclusive bounds
+    min: 7
+    max: 35
+
+# --- candidate pool ----------------------------------------------------------
+pool:
+  n_samples: 1000000                    # the "budget": 1M candidates
+  chunk_size: 5000                      # samples simulated per vectorised batch
+  n_jobs: -1                            # -1 = all cores
+  master_seed: 20200315
+  store_deaths_by_age: true             # (N, W, 16) float32  ~1.3 GB at N=1e6, W=21
+  store_infections_total: true          # (N, W)     float32  ~84 MB
+  store_infections_by_age: false        # (N, W, 16) float32  ~1.3 GB
+  store_S_total: true                   # (N, W)     float32  ~100 MB at W=25
+                                        # Susceptibles ON the day each week closes
+                                        # (a stock, not a sum). Needed for
+                                        # Rt = R0 * S(t)/N later. It MUST be stored
+                                        # now: candidates share one RNG stream per
+                                        # chunk, so a single trajectory cannot be
+                                        # re-simulated afterwards the way system B's
+                                        # can, and cumsum(infections_total) is not a
+                                        # substitute -- that counts E->I while S
+                                        # falls on S->E.
+                                        # Written to <output>/S/<tag>/, mirroring
+                                        # <output>/S_B/<tag>/ file for file.
+
+# --- ABC-with-budget selection ----------------------------------------------
+abc:
+  n_accept: 1000                        # keep the 1000 lowest-error candidates
+  target: "total"                       # "total" -> fit weekly total deaths
+                                        # "by_age" -> sum the error over the 16 age groups
+  error: "biased_wmape"                 # key in abc_errors.ERROR_FUNCS. Used by the
+                                        # retrospective fit and as the fallback for
+                                        # any n_history missing from rolling.error_for_n.
+  error_kwargs:                         # see abc_errors.biased_wmape
+    shift: 1.0                          # log((y+shift)/(yhat+shift)); 1.0 keeps the
+                                        # zero-death week of 2020-03-08 finite.
+                                        # 0.0 is the literal formula and is NOT safe
+                                        # here -- it returns inf/nan on this data.
+  # NOTE: biased_wmape was redefined (recency-weighted mean |log ratio|, harmonic
+  # weights) to match the paper. Any ../output/selections/*/rolling_biased_wmape_*
+  # produced before that change was computed with the old placeholder, which was
+  # just plain wMAPE. Re-run `abc_select.py rolling` to regenerate -- it re-scores
+  # the existing pool and needs no re-simulation.
+
+# --- retrospective fitting ---------------------------------------------------
+retrospective:
+  error: "wmape"                        # plain wMAPE for the full-period baseline fit
+  error_kwargs: {}
+  # weeks used: the whole calibration period (start_simu_date .. end_date)
+
+# --- rolling forecasts -------------------------------------------------------
+rolling:
+  n_history: [4, 5, 6, "all"]           # how many past weekly points feed the error
+  horizons: [0, 1, 2, 3, 4]             # h=0 is the current week (nowcast)
+  step: 1                               # advance the window by this many weeks
+
+  # Which error each n_history is scored with. COPIED FROM SYSTEM B
+  # (abc_seir_rolling.ERROR_FOR_N) so the two systems are selected by exactly the
+  # same rule -- otherwise a difference between them could be the metric rather
+  # than the model. Was plain "biased_wmape" for all four; that is why the old
+  # files are named rolling_biased_wmape_n4.npz and the new ones rolling_wmape_n4.npz.
+  #
+  # The short windows use wmape because with only 4-6 points the recency weighting
+  # in biased_wmape has almost nothing to weight; "all" uses biased_wmape so the
+  # 20+ point history is not dominated by the epidemic's flat tail.
+  # Any n_history left out of this map falls back to abc.error.
+  error_for_n:
+    "4": "wmape"
+    "5": "wmape"
+    "6": "wmape"
+    "all": "biased_wmape"
+  error_kwargs_for:                     # keyed by ERROR name, not by n
+    wmape: {}
+    biased_wmape:
+      shift: 1.0
+  # first_window is the index t of the CURRENT week (the last week the forecaster
+  # may see). t is 0-based on the 25-week grid that starts 2020-02-16, so t = 3 is
+  # the 4th weekly point, 2020-03-08, and the window has t+1 = 4 points of history
+  # available. The observed peak, 2020-04-12, is t = 8.
+  #
+  # 3 is set explicitly rather than left null. null means "earliest week with
+  # enough history", which window_grid() resolves as max(n_history) - 1 = 5 --
+  # i.e. late enough for the LONGEST finite history (n=6) to fit. Starting at t=3
+  # instead buys two more windows before the epidemic takes off, and lets every
+  # n_history setting run on the SAME 20 windows, with calibration_slice()'s
+  # max(0, t-n+1) truncating the longer settings while history is still short:
+  #     t=3  n=4,5,6 all use weeks [0..3]   -> identical by construction
+  #     t=4  n=4 uses [1..4];  n=5,6 use [0..4]
+  #     t=5  n=4 [2..5];  n=5 [1..5];  n=6 [0..5]   -> all distinct from here on
+  # So the n-comparison is not confounded (every setting sees the same weeks in
+  # the early windows), but the first two windows carry no information ABOUT n.
+  first_window: 3
+  # last_window is also the index t of the current week. null would resolve to
+  # W - 1 - max(horizons) = 24 - 4 = 20, i.e. stop while EVERY horizon still has
+  # observed data to score against (18 windows, last current week 2020-07-05).
+  #
+  # 22 is set instead so the panel grid matches the reference figure AND system B:
+  # 20 windows, t = 3..22, current week 2020-03-08 .. 2020-07-19. The price is
+  # that the last two windows run off the end of the data --
+  #     t=21 (07-12): h=0..3 scoreable, h=4 is not
+  #     t=22 (07-19): h=0..2 scoreable, h=3 and h=4 are not
+  # NOTE this only works on the 25-week grid. On the old 22-week grid (start_simu
+  # 2020-03-08) t=22 did not exist at all -- window_grid() does not clamp, so the
+  # last window silently scored an empty slice. Any selections/ produced before
+  # start_simu_date moved are wrong for that reason as well as the metric change.
+  # The pool only has 25 columns, so those horizons simply do not exist;
+  # abc_forecast.horizon_draws() returns NaN and the forecast band stops at
+  # 2020-08-02. Skill tables then average different numbers of windows per
+  # horizon (h=0 gets 20, h=4 gets 18) -- `score()` reports that as its `n`
+  # column, but drop to last_window: null if you need them strictly comparable.
+  last_window: 22
+  min_history: 4                        # lower bound applied to the "all" setting too

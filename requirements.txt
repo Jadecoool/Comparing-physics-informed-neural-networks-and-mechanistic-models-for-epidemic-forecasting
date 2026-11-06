@@ -1,0 +1,11 @@
+# Runs were made on Apocrita (QMUL) with python/3.8.5.
+# Versions are not pinned because the cluster environment was not frozen;
+# a local environment that imports everything used pyabc 0.12.16,
+# numpy 1.25.2, pandas 2.0.3, numba 0.58.1.
+numpy
+pandas
+scipy
+pyabc
+numba
+joblib
+pyyaml
